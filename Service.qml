@@ -40,6 +40,9 @@ Item {
   // a cached public IP, both refreshed once when a connection is (re-)established.
   property string tunnelIp: ""
   property string publicIp: ""
+  // So the panel can stop saying "Looking up…" once the lookup is actually
+  // over. A silent permanent "Looking up…" is worse than saying it failed.
+  property bool publicIpFailed: false
 
   // Country/city picker (Feature 1): loaded lazily and cached for the life of
   // the panel — 150 countries is not something worth re-fetching every poll.
@@ -55,8 +58,71 @@ Item {
   // different call, `protonvpn info`) so the LOCATIONS section can show a
   // precise reason instead of silently rendering an empty list.
   property bool countriesAuthRequired: false
-  property var citiesByCountry: ({})
-  property string citiesLoadingCode: ""
+
+  // Server intelligence: server counts, per-city breakdowns and live load
+  // figures, read out of the CLI daemon's own on-disk cache with jq. See the
+  // long note above SERVER_STATS_QUERY in Model.js for why this is the only
+  // available source — the CLI reports none of it and Proton's API is closed.
+  //
+  // XDG_CACHE_HOME with a ~/.cache fallback, same as the agents plugin does
+  // for XDG_STATE_HOME. Resolved once here rather than shelling out, so the
+  // jq processes below need no shell and therefore no quoting.
+  readonly property string _cacheHome: (Quickshell.env("XDG_CACHE_HOME") || "") !== ""
+    ? Quickshell.env("XDG_CACHE_HOME")
+    : ((Quickshell.env("HOME") || "") + "/.cache")
+  readonly property string serverCachePath: _cacheHome + "/Proton/VPN/serverlist.json"
+
+  // Recents and pins, persisted where the other Omarchy plugins keep their
+  // state (the clipboard plugin's history lives beside this).
+  readonly property string _stateHome: (Quickshell.env("XDG_STATE_HOME") || "") !== ""
+    ? Quickshell.env("XDG_STATE_HOME")
+    : ((Quickshell.env("HOME") || "") + "/.local/state")
+  readonly property string statePath: _stateHome + "/omarchy/protonvpn-state.json"
+
+  property var recentConnections: []
+  property var pinnedCountries: []
+  property var pinnedServers: []
+  readonly property int recentLimit: 20
+  // Set once the file has been read (or failed to read), so a save triggered
+  // before the first load cannot write an empty list over real state.
+  property bool stateLoaded: false
+  // What a connect in flight would add to the recents if it succeeds. Held
+  // rather than recorded up front: a connection that fails is not somewhere
+  // you have been, and would otherwise sit at the top of the list.
+  property var _pendingRecent: null
+
+  property var countryStats: ({})
+  property bool statsLoading: false
+  // Distinct from "loaded": the cache is absent on a fresh install and until
+  // the daemon has run once while signed in. False means the picker shows
+  // plain country names, exactly as it did before this feature, rather than
+  // showing an error for something the user cannot act on.
+  property bool statsAvailable: false
+  property int accountTier: 0
+  // Roughly how old the cached load figures are, in minutes (-1 when unknown).
+  // Not a boolean: see the note above the query in Model.js — the expiry the
+  // cache carries is the daemon's refresh schedule, so "past expiry" is
+  // normal and says nothing. Only a genuinely large age is worth a word, and
+  // loadAgeNotice() decides where that line is.
+  property int loadsAgeMinutes: -1
+  readonly property string loadsAgeNotice: Model.loadAgeNotice(loadsAgeMinutes)
+  property double _statsLoadedAtMs: 0
+  property double countriesCachedAtMs: 0
+  // Countries change on the order of never, so a cached list is good for a
+  // long time. It is still refreshed in the background past this, with the
+  // cached one on screen throughout.
+  readonly property int countriesMaxAgeMs: 21600000
+  // Loads are the perishable part of this data, so unlike the country list
+  // (fetched once for the life of the panel) the roll-up is re-read when the
+  // picker is opened again after a few minutes.
+  readonly property int statsMaxAgeMs: 300000
+
+  property var detailByCountry: ({})
+  property string detailLoadingCode: ""
+  // A second expand issued while the first is still running would otherwise
+  // be dropped by the running-process guard, leaving a country stuck on
+  // "Loading…" until it was collapsed and reopened.
+  property string _detailPendingCode: ""
 
   readonly property int refreshIntervalSec: intSetting("refreshIntervalSec", 15, 5, 3600)
   readonly property bool busy: whichProcess.running || infoProcess.running || statusProcess.running || connectProcess.running || disconnectProcess.running
@@ -75,13 +141,14 @@ Item {
   property int _infoFailStreak: 0
   readonly property int maxPollFailStreak: 3
 
+  property string _statsOutput: ""
+  property string _detailOutput: ""
   property string _statusOutput: ""
   property string _statusError: ""
   property string _infoOutput: ""
   property string _infoError: ""
   property string _countriesOutput: ""
   property string _countriesError: ""
-  property string _citiesOutput: ""
   property string _tunnelIpOutput: ""
   property string _publicIpOutput: ""
   property string _actionOutput: ""
@@ -114,6 +181,24 @@ Item {
 
   function countryFlagEmoji(code) {
     return Model.countryFlagEmoji(code)
+  }
+
+  // Same thin re-export as the three above, so the panel keeps talking to one
+  // object instead of importing Model.js itself.
+  function describeCountry(stats) {
+    return Model.describeCountry(stats)
+  }
+
+  function formatServerCount(count) {
+    return Model.formatServerCount(count)
+  }
+
+  function featureBadges(entry) {
+    return Model.featureBadges(entry)
+  }
+
+  function isLocked(tier) {
+    return Model.isLocked(tier, accountTier)
   }
 
   function resetUnavailable(message) {
@@ -215,13 +300,23 @@ Item {
     }
   }
 
-  function loadCountries() {
-    if (countriesLoaded || countriesLoading) return
+  // `force` refetches behind a list that is already on screen; without it a
+  // list we already have is kept and nothing is fetched.
+  function loadCountries(force) {
+    if (countriesLoading) return
+    if (force !== true && countriesLoaded) return
     countriesLoading = true
     _countriesOutput = ""
     _countriesError = ""
     countriesProcess.command = ["protonvpn", "countries", "list"]
     countriesProcess.running = true
+  }
+
+  // Called when the picker opens. Whatever is cached stays on screen; a
+  // refetch only happens if there is nothing at all, or the cache is old.
+  function refreshCountries() {
+    if (!countriesLoaded || countries.length === 0) { loadCountries(); return }
+    if (Date.now() - countriesCachedAtMs > countriesMaxAgeMs) loadCountries(true)
   }
 
   // Self-correct once the user signs back in: countriesLoaded was
@@ -232,17 +327,120 @@ Item {
   onNeedsLoginChanged: {
     if (!needsLogin && countriesAuthRequired) {
       countriesAuthRequired = false
-      loadCountries()
+      loadCountries(true)
     }
   }
 
-  function loadCities(code) {
+  function loadState(raw) {
+    var parsed = Model.parseState(raw)
+    recentConnections = parsed.recent
+    pinnedCountries = parsed.pinnedCountries
+    pinnedServers = parsed.pinnedServers
+    // Adopt the cached country list only if the live one has not already
+    // arrived, so a slow file read can never overwrite fresher data.
+    if (parsed.countries.length > 0 && countries.length === 0) {
+      countries = parsed.countries
+      countriesCachedAtMs = parsed.countriesCachedAt
+      // Counts as loaded: the picker shows it immediately, and the age check
+      // in refreshCountries() is what decides whether to go and refresh it.
+      countriesLoaded = true
+    }
+    stateLoaded = true
+  }
+
+  function saveState() {
+    if (!stateLoaded) return
+    stateFile.setText(JSON.stringify({
+      version: 1,
+      recent: recentConnections.slice(0, recentLimit),
+      pinnedCountries: pinnedCountries,
+      pinnedServers: pinnedServers,
+      countries: countries,
+      countriesCachedAt: countriesCachedAtMs
+    }, null, 2) + "\n")
+  }
+
+  function rememberConnection(entry) {
+    if (!entry) return
+    recentConnections = Model.addRecent(recentConnections, entry, recentLimit)
+    saveState()
+  }
+
+  function isCountryPinned(code) {
+    return Model.listContains(pinnedCountries, code)
+  }
+
+  function toggleCountryPin(code) {
+    pinnedCountries = Model.toggleInList(pinnedCountries, code)
+    saveState()
+  }
+
+  function isServerPinned(name) {
+    return Model.listContains(pinnedServers, name)
+  }
+
+  function toggleServerPin(name) {
+    pinnedServers = Model.toggleInList(pinnedServers, name)
+    // The cached per-country detail was cut with the OLD pin list baked into
+    // it (the query unions pinned servers in past its 20-row cap), so it no
+    // longer matches. Drop it and let the next expand re-cut.
+    detailByCountry = ({})
+    saveState()
+  }
+
+  function describeRecent(entry) {
+    return Model.describeRecent(entry)
+  }
+
+  function recentKey(entry) {
+    return Model.recentKey(entry)
+  }
+
+  function loadServerStats(force) {
+    if (statsLoading) return
+    var age = Date.now() - _statsLoadedAtMs
+    if (force !== true && _statsLoadedAtMs > 0 && age < statsMaxAgeMs) return
+    statsLoading = true
+    _statsOutput = ""
+    statsProcess.command = ["jq", "-c", Model.SERVER_STATS_QUERY, serverCachePath]
+    statsProcess.running = true
+  }
+
+  function loadCountryDetail(code) {
     var key = String(code || "")
-    if (key === "" || citiesByCountry[key] !== undefined || citiesLoadingCode === key || citiesProcess.running) return
-    citiesLoadingCode = key
-    _citiesOutput = ""
-    citiesProcess.command = ["protonvpn", "cities", "list", key]
-    citiesProcess.running = true
+    if (key === "" || detailByCountry[key] !== undefined) return
+    if (detailProcess.running) { _detailPendingCode = key; return }
+    detailLoadingCode = key
+    _detailOutput = ""
+    detailProcess.command = ["jq", "-c", "--arg", "cc", key,
+                             "--argjson", "pins", JSON.stringify(pinnedServers),
+                             Model.COUNTRY_DETAIL_QUERY, serverCachePath]
+    detailProcess.running = true
+  }
+
+  // Connecting to one named server (`protonvpn connect GR#5`) rather than to
+  // a country or city. Same guards as connectLocation() - see the note there
+  // about why the opposite direction has to be guarded too.
+  function countryNameFor(code) {
+    var key = String(code || "")
+    for (var i = 0; i < countries.length; i++) {
+      if (String(countries[i].code || "") === key) return String(countries[i].name || key)
+    }
+    return key
+  }
+
+  function connectServer(name, countryCode, cityName) {
+    if (!installed || needsLogin || connectProcess.running || disconnectProcess.running) return
+    var server = String(name || "")
+    if (server === "") return
+    _pendingRecent = { kind: "server", name: server,
+                       code: String(countryCode || ""), city: String(cityName || "") }
+    _desired = 1
+    _actionOutput = ""
+    _actionError = ""
+    actionStatus = "Connecting to " + server + "…"
+    connectProcess.command = ["protonvpn", "connect", server]
+    connectProcess.running = true
   }
 
   function connectLocation(countryCode, cityName) {
@@ -258,6 +456,9 @@ Item {
     _actionOutput = ""
     _actionError = ""
     actionStatus = "Connecting to " + (city !== "" ? (city + ", " + code) : code) + "…"
+    _pendingRecent = city !== ""
+      ? { kind: "city", code: code, city: city }
+      : { kind: "country", code: code, label: countryNameFor(code) }
     var cmd = ["protonvpn", "connect", "--country", code]
     if (city !== "") { cmd.push("--city"); cmd.push(city) }
     connectProcess.command = cmd
@@ -274,9 +475,16 @@ Item {
   function refreshPublicIp() {
     if (publicIpProcess.running) return
     _publicIpOutput = ""
+    publicIpFailed = false
+    // -4 because the row above this one shows the IPv4 tunnel address, so an
+    // IPv6 answer here would be comparing two different things. Without it
+    // curl returns whichever family resolves first, which on this machine is
+    // IPv6 — and that answer was then dropped by the IPv4-only parser,
+    // leaving the field stuck on "Looking up…" for good.
+    //
     // Bounded and best-effort — a slow/unreliable network call here should
     // never hold up the rest of the panel.
-    publicIpProcess.command = ["curl", "-s", "--max-time", "4", "https://ifconfig.me"]
+    publicIpProcess.command = ["curl", "-s", "-4", "--max-time", "4", "https://ifconfig.me"]
     publicIpProcess.running = true
   }
 
@@ -466,9 +674,16 @@ Item {
       var stdout = String(countriesStdout.text || root._countriesOutput || "")
       var stderr = String(countriesStderr.text || root._countriesError || "")
       if (exitCode === 0) {
+        var fetched = Model.parseCountries(stdout)
         root.countriesAuthRequired = false
-        root.countries = Model.parseCountries(stdout)
-        root.countriesLoaded = true
+        // A parse that yields nothing is a bad response, not an empty world -
+        // keep whatever is already on screen rather than blanking the picker.
+        if (fetched.length > 0) {
+          root.countries = fetched
+          root.countriesLoaded = true
+          root.countriesCachedAtMs = Date.now()
+          root.saveState()
+        }
         return
       }
       if (Model.classifyCliFailure(stderr || stdout) === "authRequired") {
@@ -488,28 +703,69 @@ Item {
     }
   }
 
+  FileView {
+    id: stateFile
+    path: root.statePath
+    watchChanges: true
+    atomicWrites: true
+    printErrors: false
+    onLoaded: root.loadState(text())
+    // No file yet is the normal first-run case, not an error.
+    onLoadFailed: root.loadState("")
+    onFileChanged: reload()
+  }
+
   Process {
-    id: citiesProcess
+    id: statsProcess
     running: false
     command: []
-    stdout: StdioCollector { id: citiesStdout; waitForEnd: true; onStreamFinished: root._citiesOutput = text }
-    stderr: StdioCollector { id: citiesStderr; waitForEnd: true }
+    stdout: StdioCollector { id: statsStdout; waitForEnd: true; onStreamFinished: root._statsOutput = text }
+    stderr: StdioCollector { waitForEnd: true }
     onExited: function(exitCode) {
-      var key = root.citiesLoadingCode
-      root.citiesLoadingCode = ""
-      if (exitCode === 0 && key !== "") {
-        var next = {}
-        for (var k in root.citiesByCountry) next[k] = root.citiesByCountry[k]
-        next[key] = Model.parseCities(String(citiesStdout.text || root._citiesOutput || ""))
-        root.citiesByCountry = next
-      } else if (key !== "") {
-        // Leave citiesByCountry[key] undefined (rather than []) so the next
-        // expand attempt retries instead of being permanently treated as
-        // "loaded, zero cities" - but say SOMETHING, rather than the
-        // expansion silently showing neither a spinner nor an error.
-        root.actionStatus = "Could not load cities"
-        actionStatusTimer.restart()
+      root.statsLoading = false
+      // A missing cache file is the expected case on a fresh install, so jq
+      // exiting non-zero is not worth surfacing as an error - it just means
+      // no enrichment, and the picker falls back to plain country names.
+      var parsed = exitCode === 0 ? Model.parseServerStats(String(statsStdout.text || root._statsOutput || "")) : null
+      if (!parsed) {
+        root.statsAvailable = false
+        return
       }
+      root.countryStats = parsed.byCountry
+      root.accountTier = parsed.maxTier
+      root.loadsAgeMinutes = parsed.loadsAgeMinutes
+      root.statsAvailable = true
+      root._statsLoadedAtMs = Date.now()
+      // The per-country breakdowns were cut from the same file, so they carry
+      // the same load figures this roll-up just replaced. Dropping them keeps
+      // a country's expanded detail from disagreeing with its own summary row.
+      root.detailByCountry = ({})
+    }
+  }
+
+  Process {
+    id: detailProcess
+    running: false
+    command: []
+    stdout: StdioCollector { id: detailStdout; waitForEnd: true; onStreamFinished: root._detailOutput = text }
+    stderr: StdioCollector { waitForEnd: true }
+    onExited: function(exitCode) {
+      var key = root.detailLoadingCode
+      root.detailLoadingCode = ""
+      if (key !== "") {
+        var parsed = exitCode === 0 ? Model.parseCountryDetail(String(detailStdout.text || root._detailOutput || "")) : null
+        // Cache the failure as null rather than leaving the key undefined:
+        // undefined means "not asked for yet" and would re-run jq over 24MB
+        // on every repaint of an expanded country that has no data.
+        var next = {}
+        for (var k in root.detailByCountry) next[k] = root.detailByCountry[k]
+        next[key] = parsed
+        root.detailByCountry = next
+      }
+      // Whatever was asked for while this one was in flight.
+      var pending = root._detailPendingCode
+      root._detailPendingCode = ""
+      if (pending !== "" && pending !== key) root.loadCountryDetail(pending)
     }
   }
 
@@ -530,7 +786,9 @@ Item {
     stdout: StdioCollector { id: publicIpStdout; waitForEnd: true; onStreamFinished: root._publicIpOutput = text }
     onExited: function(exitCode) {
       if (!root.running) return
-      if (exitCode === 0) root.publicIp = Model.parsePublicIp(String(publicIpStdout.text || root._publicIpOutput || ""))
+      var value = exitCode === 0 ? Model.parsePublicIp(String(publicIpStdout.text || root._publicIpOutput || "")) : ""
+      root.publicIp = value
+      root.publicIpFailed = value === ""
     }
   }
 
@@ -545,10 +803,13 @@ Item {
       var stderr = String(connectStderr.text || root._actionError || "")
       if (exitCode !== 0) {
         root._desired = -1
+        root._pendingRecent = null
         root.lastError = Model.elideStatus(stderr || stdout || "protonvpn connect failed")
         root.actionStatus = root.lastError
         actionStatusTimer.restart()
       } else {
+        root.rememberConnection(root._pendingRecent)
+        root._pendingRecent = null
         root.lastError = ""
         root.actionStatus = ""
         // Unconditional, not just left to parseStatus()'s own
