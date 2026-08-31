@@ -151,7 +151,7 @@ function parseCities(raw) {
 }
 
 // `ip -4 -o addr show <iface>` prints e.g.:
-//   4: proton0    inet 10.2.0.2/32 scope global proton0\ ...
+//   4: proton0    inet 10.x.x.x/32 scope global proton0\ ...
 function parseTunnelIp(raw) {
   var match = String(raw || "").match(/inet\s+(\d{1,3}(?:\.\d{1,3}){3})/)
   return match ? match[1] : ""
