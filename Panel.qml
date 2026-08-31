@@ -116,6 +116,12 @@ Panel {
 
   function buildLocationRows() {
     if (locationTab === "recent") return buildRecentRows()
+    // Signed out the picker shows "Sign in to browse countries" instead of
+    // the list. The rows have to be absent, not merely hidden: the keyboard
+    // cursor walks locationRows, so leaving a cached 148-country list in it
+    // let `j` disappear into rows nothing was drawing, and put ~148
+    // keypresses between the toggle and the sign-in button below it.
+    if (vpn.needsLogin || vpn.countriesAuthRequired) return []
     var rows = []
     var list = filteredCountries
     for (var i = 0; i < list.length; i++) {
@@ -327,6 +333,14 @@ Panel {
     // Left/right expands and collapses the row under the cursor, so the tree
     // is reachable without the mouse - the chevron is a mouse target only.
     if (dx !== 0) {
+      // The tab strip is a ButtonGroup with no cursor section of its own, so
+      // left/right on the row directly above it switches tabs. Without this
+      // the Recent tab was reachable only with the mouse, in a panel whose
+      // whole point is that it is keyboard-driven.
+      if (focusSection === "locationsToggle" && locationPickerOpen) {
+        selectTab(dx > 0 ? "recent" : "all")
+        return
+      }
       if (focusSection !== "locations") return
       var target = rowAt(locationIndex)
       if (!target) return
@@ -385,6 +399,17 @@ Panel {
     else vpn.signOut()
   }
 
+  function selectTab(tab) {
+    if (locationTab === tab) return
+    locationTab = tab
+    // The two tabs are different lists; an index from one means nothing in
+    // the other.
+    locationIndex = 0
+    disarmPointer()
+    ensureCursor()
+    if (locationsList) locationsList.positionViewAtBeginning()
+  }
+
   function toggleLocationPicker() {
     locationPickerOpen = !locationPickerOpen
     if (!locationPickerOpen) {
@@ -425,10 +450,12 @@ Panel {
       return
     }
     if (row.kind === "city") {
-      // "Secure Core" is a bucket this panel invented to keep those servers
-      // out of the "Other" city - Proton has no such city, so connecting to
-      // it by name would fail. Fall back to the country.
-      if (row.stats && row.stats.sc === true) vpn.connectLocation(row.code, "")
+      // "Secure Core" and "Other" are both buckets the detail query invents -
+      // the first for servers Proton leaves City-less, the second for any
+      // other null City. Neither is a city the CLI has ever heard of, so
+      // `--city Secure Core` / `--city Other` just errors. Fall back to the
+      // country, which is what those servers actually are.
+      if (isSyntheticCity(row)) vpn.connectLocation(row.code, "")
       else vpn.connectLocation(row.code, row.city)
       return
     }
@@ -453,6 +480,13 @@ Panel {
   function togglePinAtCursor() {
     if (focusSection !== "locations") return
     togglePin(rowAt(locationIndex))
+  }
+
+  // Buckets invented by COUNTRY_DETAIL_QUERY rather than reported by Proton.
+  function isSyntheticCity(row) {
+    if (!row) return false
+    if (row.stats && row.stats.sc === true) return true
+    return String(row.city || "") === "Other"
   }
 
   function toggleExpanded(row) {
@@ -666,6 +700,17 @@ Panel {
   PointerMoveGate {
     id: pointerGate
     referenceItem: keyCatcher
+  }
+
+  // The service drops its per-country detail whenever the data it was cut
+  // from changes (a server pin, or a stats reload). expandRow() only fetches
+  // on a change of expanded country, so without this an already-open country
+  // would sit on "Loading servers…" until collapsed and reopened.
+  Connections {
+    target: vpn
+    function onDetailCleared() {
+      if (root.expandedCountryCode !== "") vpn.loadCountryDetail(root.expandedCountryCode)
+    }
   }
 
   // Holds one `key` per visible row and nothing else — see syncRows().
@@ -1080,15 +1125,7 @@ Panel {
                 accent: root.foreground
                 fontFamily: root.fontFamily
                 focusable: false
-                onChanged: function(value) {
-                  root.locationTab = String(value)
-                  // The two tabs are different lists; a cursor index from one
-                  // means nothing in the other.
-                  root.locationIndex = 0
-                  root.disarmPointer()
-                  root.ensureCursor()
-                  if (locationsList) locationsList.positionViewAtBeginning()
-                }
+                onChanged: function(value) { root.selectTab(String(value)) }
               }
 
               TextField {
@@ -1127,7 +1164,10 @@ Panel {
                     return
                   }
                   if (event.key === Qt.Key_Escape) {
-                    root.locationPickerOpen = false
+                    // Via the toggle, not by setting the flag: closing has to
+                    // clear the expansion state too, or reopening restores a
+                    // tree the user just dismissed.
+                    if (root.locationPickerOpen) root.toggleLocationPicker()
                     keyCatcher.forceActiveFocus()
                     event.accepted = true
                   }
@@ -1206,6 +1246,8 @@ Panel {
               // bluetooth panel's device list is one.
               ListView {
                 id: locationsList
+                // buildLocationRows() already returns nothing while signed
+                // out on this tab, so an empty model is the whole condition.
                 visible: rowModel.count > 0
                 width: parent.width
                 height: Math.min(contentHeight, Style.space(280))
@@ -1335,10 +1377,14 @@ Panel {
     // point of the list is to show what is there - but they are dimmed and
     // carry a PLUS badge, and clicking one would only fail at the CLI.
     readonly property bool locked: isServer && row && row.locked === true
+    // -1 means "no figure", which hides the meter. Guarded against NaN,
+    // because a QML int property coerces NaN to 0 and a missing load would
+    // otherwise render as a confident green 0%.
     readonly property int load: {
-      if (isServer && row && row.server) return Number(row.server.load)
-      if (stats && stats.load !== undefined) return Number(stats.load)
-      return -1
+      var value = NaN
+      if (isServer && row && row.server) value = Number(row.server.load)
+      else if (stats && stats.load !== undefined) value = Number(stats.load)
+      return isFinite(value) ? value : -1
     }
 
     hasCursor: root.cursorActive && root.focusSection === "locations" && root.locationIndex === rowIndex

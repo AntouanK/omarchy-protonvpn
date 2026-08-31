@@ -43,6 +43,7 @@ Item {
   // So the panel can stop saying "Looking up…" once the lookup is actually
   // over. A silent permanent "Looking up…" is worse than saying it failed.
   property bool publicIpFailed: false
+  property bool _publicIpTriedV4: false
 
   // Country/city picker (Feature 1): loaded lazily and cached for the life of
   // the panel — 150 countries is not something worth re-fetching every poll.
@@ -315,7 +316,10 @@ Item {
   // Called when the picker opens. Whatever is cached stays on screen; a
   // refetch only happens if there is nothing at all, or the cache is old.
   function refreshCountries() {
-    if (!countriesLoaded || countries.length === 0) { loadCountries(); return }
+    // Forced: an empty list can coexist with countriesLoaded === true now
+    // that a cached list sets that flag, and an un-forced call would return
+    // immediately and leave the picker permanently empty.
+    if (!countriesLoaded || countries.length === 0) { loadCountries(true); return }
     if (Date.now() - countriesCachedAtMs > countriesMaxAgeMs) loadCountries(true)
   }
 
@@ -383,10 +387,18 @@ Item {
     pinnedServers = Model.toggleInList(pinnedServers, name)
     // The cached per-country detail was cut with the OLD pin list baked into
     // it (the query unions pinned servers in past its 20-row cap), so it no
-    // longer matches. Drop it and let the next expand re-cut.
+    // longer matches. Dropping it is not enough on its own: expandRow() only
+    // fetches on a CHANGE of expanded country, so a country that is already
+    // open would sit on "Loading servers…" until it was collapsed and
+    // reopened. detailCleared() lets the panel re-request what it is showing.
     detailByCountry = ({})
     saveState()
+    detailCleared()
   }
+
+  // Emitted whenever detailByCountry is dropped wholesale, so whoever has a
+  // country expanded can ask for it again.
+  signal detailCleared()
 
   function describeRecent(entry) {
     return Model.describeRecent(entry)
@@ -484,7 +496,19 @@ Item {
     //
     // Bounded and best-effort — a slow/unreliable network call here should
     // never hold up the rest of the panel.
+    _publicIpTriedV4 = true
     publicIpProcess.command = ["curl", "-s", "-4", "--max-time", "4", "https://ifconfig.me"]
+    publicIpProcess.running = true
+  }
+
+  // A v6-only host has no IPv4 answer to give, so -4 simply fails there and
+  // the row would read "Unavailable" forever while the parser's IPv6 branch
+  // sat unreachable. One retry without -4 makes that branch real.
+  function retryPublicIpAnyFamily() {
+    if (publicIpProcess.running) return
+    _publicIpTriedV4 = false
+    _publicIpOutput = ""
+    publicIpProcess.command = ["curl", "-s", "--max-time", "4", "https://ifconfig.me"]
     publicIpProcess.running = true
   }
 
@@ -738,8 +762,11 @@ Item {
       root._statsLoadedAtMs = Date.now()
       // The per-country breakdowns were cut from the same file, so they carry
       // the same load figures this roll-up just replaced. Dropping them keeps
-      // a country's expanded detail from disagreeing with its own summary row.
+      // a country's expanded detail from disagreeing with its own summary row
+      // - but see toggleServerPin(): an expanded country has to be told to
+      // ask again, or it is stuck showing "Loading servers…".
       root.detailByCountry = ({})
+      root.detailCleared()
     }
   }
 
@@ -787,6 +814,10 @@ Item {
     onExited: function(exitCode) {
       if (!root.running) return
       var value = exitCode === 0 ? Model.parsePublicIp(String(publicIpStdout.text || root._publicIpOutput || "")) : ""
+      if (value === "" && root._publicIpTriedV4) {
+        root.retryPublicIpAnyFamily()
+        return
+      }
       root.publicIp = value
       root.publicIpFailed = value === ""
     }

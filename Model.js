@@ -406,7 +406,14 @@ function listContains(list, value) {
 // by a future version. Anything unreadable degrades to empty rather than
 // throwing, because none of this is worth breaking the panel over.
 function parseState(raw) {
-  var empty = { recent: [], pinnedCountries: [], pinnedServers: [] }
+  // Must carry EVERY key the success path returns. It did not carry
+  // `countries`, so on a fresh install (no file -> onLoadFailed -> "") the
+  // caller's `parsed.countries.length` threw before it could set
+  // stateLoaded, and saveState()'s `if (!stateLoaded) return` then silenced
+  // every write for the rest of the session - pins, recents and the country
+  // cache all lost, the file never created, repeating every launch.
+  var empty = { recent: [], pinnedCountries: [], pinnedServers: [],
+                countries: [], countriesCachedAt: 0 }
   var text = String(raw || "").trim()
   if (text === "") return empty
   var parsed

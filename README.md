@@ -28,6 +28,7 @@ Inside the panel:
 - `l` / `h` or left/right arrows: expand and collapse the row under the
   cursor — a country into its cities, a city into its servers
 - `p`: pin or unpin the row under the cursor
+- `l` / `h` on the LOCATIONS row itself: switch between the All and Recent tabs
 - `enter` / `space`: activate the current row (toggle connection, open the
   location picker, connect to the selected country/city/server, sign in/out)
 - `t`: toggle the connection
