@@ -1062,25 +1062,37 @@ Panel {
                 anchors.rightMargin: Style.space(10)
                 spacing: Style.space(8)
 
+                // Mixed pixelSizes and weights in this row (the icon and
+                // chevron at Style.font.body, LOCATIONS bold vs the summary
+                // regular, both at Style.font.caption) can each report a
+                // slightly different implicitHeight/ascent, so AlignVCenter
+                // — which centers each item's own bounding box within the
+                // row — does not reliably line up their glyph baselines.
+                // AlignBaseline asks the layout to align by actual text
+                // baseline instead, which is what "these look aligned" means
+                // for text of differing size/weight sitting side by side.
                 Text {
                   text: "󰍎"
                   color: root.dim
                   font.family: root.fontFamily
                   font.pixelSize: Style.font.body
-                  Layout.alignment: Qt.AlignVCenter
+                  Layout.alignment: Qt.AlignBaseline
                 }
 
                 // Styled as the section header it replaces (PanelSectionHeader
-                // is bold caption at Qt.darker(fg, 1.4), with the same top
-                // padding so the nerd-font overshoot is not clipped).
+                // is bold caption at Qt.darker(fg, 1.4)) but WITHOUT its
+                // topPadding: that padding exists to keep a header's nerd-font
+                // overshoot from being clipped when it sits at the top of a
+                // clipping list (PanelSectionHeader's own comment) — this row
+                // isn't one of those (it's inline next to sibling Text items
+                // in a plain RowLayout).
                 Text {
                   text: "LOCATIONS"
                   color: Qt.darker(root.foreground, 1.4)
                   font.family: root.fontFamily
                   font.pixelSize: Style.font.caption
                   font.bold: true
-                  topPadding: Math.ceil(Style.font.caption * 0.15)
-                  Layout.alignment: Qt.AlignVCenter
+                  Layout.alignment: Qt.AlignBaseline
                 }
 
                 // What is behind the section, so the header earns its row:
@@ -1092,7 +1104,7 @@ Panel {
                   font.family: root.fontFamily
                   font.pixelSize: Style.font.caption
                   elide: Text.ElideRight
-                  Layout.alignment: Qt.AlignVCenter
+                  Layout.alignment: Qt.AlignBaseline
                 }
 
                 Text {
@@ -1100,7 +1112,7 @@ Panel {
                   color: root.dim
                   font.family: root.fontFamily
                   font.pixelSize: Style.font.body
-                  Layout.alignment: Qt.AlignVCenter
+                  Layout.alignment: Qt.AlignBaseline
                 }
               }
             }
