@@ -131,11 +131,9 @@ Item {
   // Model.js for the mechanism — the short version is that it is a ProtonVPN
   // bug, it is not fixable from here, and the only thing this widget can do
   // about it is stop pretending the user simply forgot to sign in.
-  readonly property string _dataHome: (Quickshell.env("XDG_DATA_HOME") || "") !== ""
-    ? Quickshell.env("XDG_DATA_HOME")
-    : ((Quickshell.env("HOME") || "") + "/.local/share")
   // "" until probed, then "ok" | "plaintext" | "corrupt".
   property string keyringHealth: ""
+  property string _keyringOutput: ""
   // An explicit sign-out is the one case where needsLogin means exactly what
   // it says, and blaming the keyring for it would be a lie. Cleared again by
   // the next `info` poll that reports a real account.
@@ -254,7 +252,8 @@ Item {
   // files, read with grep, printing one word and never any secret.
   function probeKeyring() {
     if (keyringProbe.running) return
-    keyringProbe.command = ["bash", "-c", Model.KEYRING_PROBE, "protonvpn-keyring-probe", root._dataHome]
+    _keyringOutput = ""
+    keyringProbe.command = ["bash", "-c", Model.KEYRING_PROBE]
     keyringProbe.running = true
   }
 
@@ -764,11 +763,19 @@ Item {
     id: keyringProbe
     running: false
     command: []
-    stdout: StdioCollector { id: keyringProbeStdout; waitForEnd: true }
+    // Mirrored into a property the same way every other process here does it:
+    // the collector's own `text` is not reliably populated by the time
+    // onExited runs.
+    stdout: StdioCollector { id: keyringProbeStdout; waitForEnd: true; onStreamFinished: root._keyringOutput = text }
     onExited: function(exitCode) {
-      var out = String(keyringProbeStdout.text || "").trim()
+      // "<verdict> <dir>" — the directory is only there so a surprising
+      // verdict can be traced to the path it came from.
+      var raw = String(keyringProbeStdout.text || root._keyringOutput || "").trim()
+      var out = raw.split(" ")[0]
       // Anything unexpected reads as "ok": a probe that cannot answer must
       // not put an accusatory notice in front of the user.
+      if (exitCode !== 0 || (out !== "ok" && out !== "plaintext" && out !== "corrupt"))
+        console.warn("protonvpn", "keyring probe failed (" + exitCode + "):", Model.elideStatus(raw))
       root.keyringHealth = (exitCode === 0 && (out === "plaintext" || out === "corrupt")) ? out : "ok"
     }
   }

@@ -370,7 +370,12 @@ function loadAgeNotice(minutes) {
 // "Sign in to ProtonVPN" as though nothing were wrong, which is what sends
 // the user back around the loop without ever learning why.
 
-// One word on stdout: ok | plaintext | corrupt. $1 is the keyrings directory.
+// Prints "<verdict> <dir>": ok | plaintext | corrupt, plus the directory it
+// looked in, so a wrong answer can be told apart from a wrong path.
+//
+// The directory is resolved in the shell rather than passed in, because the
+// process inherits the real session environment and Quickshell.env() does not
+// necessarily see the same XDG variables.
 // Deliberately prints no part of any secret, only a verdict.
 //
 // A passwordless keyring is plain text and starts with a literal `[keyring]`
@@ -379,8 +384,8 @@ function loadAgeNotice(minutes) {
 // line of an intact file is a `[section]`, a `key=value`, or blank, so any
 // line that is none of those is a secret that has spilled across the file.
 var KEYRING_PROBE = [
-  'dir="$1"; out=ok',
-  '[ -d "$dir" ] || { echo ok; exit 0; }',
+  'dir="${XDG_DATA_HOME:-$HOME/.local/share}/keyrings"; out=ok',
+  '[ -d "$dir" ] || { echo "ok $dir"; exit 0; }',
   'for f in "$dir"/*.keyring; do',
   '  [ -f "$f" ] || continue',
   '  read -r first < "$f" || continue',
@@ -389,7 +394,7 @@ var KEYRING_PROBE = [
   '  out=plaintext',
   '  if grep -qvE "^\\[[^]]*\\]$|^[A-Za-z][A-Za-z0-9_-]*=|^$" "$f"; then out=corrupt; break; fi',
   'done',
-  'echo "$out"'
+  'echo "$out $dir"'
 ].join("\n")
 
 // Kept short on purpose: this renders as a wrapped caption in a bar popup,
