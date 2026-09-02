@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "antouank.protonvpn",
   "name": "ProtonVPN",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "author": "antouank",
   "license": "MIT",
   "description": "ProtonVPN status, connect/disconnect, and sign-in/sign-out in the Omarchy bar.",

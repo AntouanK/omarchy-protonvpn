@@ -49,7 +49,14 @@ Panel {
   // actions). Signed-in state is now just the bare account name, with no
   // verb at all, so there's only one thing on this row that reads as a
   // button.
-  readonly property string authDetail: vpn.needsLogin ? "Opens a terminal for your username and password" : (vpn.accountName !== "" ? vpn.accountName : "Account active")
+  readonly property string authDetail: {
+    // Signing in is still the right next step, so the label above stays put —
+    // but saying only that invites the user to run the same loop again, so
+    // when the keyring is the cause the detail line says whose fault it is.
+    if (vpn.sessionLikelyLost) return "Signed out by a keyring bug, not by you"
+    if (vpn.needsLogin) return "Opens a terminal for your username and password"
+    return vpn.accountName !== "" ? vpn.accountName : "Account active"
+  }
   // "148 countries · 194 cities", or just the country count until the server
   // cache has been read. Empty while there is genuinely nothing known yet, so
   // the header does not flash a zero on the way up.
@@ -1356,6 +1363,20 @@ Panel {
                   }
                 }
               }
+            }
+
+            // Wrapped, not elided: this one is worth reading to the end,
+            // because the last clause is the only part the user can act on.
+            Text {
+              visible: vpn.keyringNotice !== ""
+              width: parent.width
+              leftPadding: Style.space(10)
+              rightPadding: Style.space(10)
+              text: vpn.keyringNotice
+              color: root.urgent
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.caption
+              wrapMode: Text.WordWrap
             }
           }
         }

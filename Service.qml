@@ -125,6 +125,25 @@ Item {
   // "Loading…" until it was collapsed and reopened.
   property string _detailPendingCode: ""
 
+  // --- Keyring health --------------------------------------------------
+  // A passwordless gnome-keyring cannot hold the ProtonVPN session intact, so
+  // the app is silently signed out on every restart. See keyringNotice() in
+  // Model.js for the mechanism — the short version is that it is a ProtonVPN
+  // bug, it is not fixable from here, and the only thing this widget can do
+  // about it is stop pretending the user simply forgot to sign in.
+  readonly property string _dataHome: (Quickshell.env("XDG_DATA_HOME") || "") !== ""
+    ? Quickshell.env("XDG_DATA_HOME")
+    : ((Quickshell.env("HOME") || "") + "/.local/share")
+  // "" until probed, then "ok" | "plaintext" | "corrupt".
+  property string keyringHealth: ""
+  // An explicit sign-out is the one case where needsLogin means exactly what
+  // it says, and blaming the keyring for it would be a lie. Cleared again by
+  // the next `info` poll that reports a real account.
+  property bool _userSignedOut: false
+  readonly property bool sessionLikelyLost: needsLogin && !_userSignedOut
+    && (keyringHealth === "corrupt" || keyringHealth === "plaintext")
+  readonly property string keyringNotice: sessionLikelyLost ? Model.keyringNotice(keyringHealth) : ""
+
   readonly property int refreshIntervalSec: intSetting("refreshIntervalSec", 15, 5, 3600)
   readonly property bool busy: whichProcess.running || infoProcess.running || statusProcess.running || connectProcess.running || disconnectProcess.running
 
@@ -231,6 +250,14 @@ Item {
     refreshStatusAndAccount()
   }
 
+  // Cheap enough to redo whenever the account drops out: a handful of small
+  // files, read with grep, printing one word and never any secret.
+  function probeKeyring() {
+    if (keyringProbe.running) return
+    keyringProbe.command = ["bash", "-c", Model.KEYRING_PROBE, "protonvpn-keyring-probe", root._dataHome]
+    keyringProbe.running = true
+  }
+
   function refreshStatusAndAccount() {
     if (!installed) return
     var launched = false
@@ -292,6 +319,7 @@ Item {
     if (name !== "") {
       needsLogin = false
       accountName = name
+      _userSignedOut = false
     } else {
       needsLogin = true
       accountName = ""
@@ -329,6 +357,9 @@ Item {
   // proactively too, the moment `info` reports we're signed in again,
   // instead of waiting for the user to re-open the picker.
   onNeedsLoginChanged: {
+    // Re-read rather than trusting the startup probe: the collection is
+    // wiped at daemon start, which can be long after this widget booted.
+    if (needsLogin) probeKeyring()
     if (!needsLogin && countriesAuthRequired) {
       countriesAuthRequired = false
       loadCountries(true)
@@ -561,6 +592,8 @@ Item {
     signoutProcess.running = true
   }
 
+  Component.onCompleted: probeKeyring()
+
   Timer {
     id: refreshTimer
     interval: root.refreshIntervalSec * 1000
@@ -724,6 +757,19 @@ Item {
       // auth problem. Leave countriesLoaded false so the next picker-open
       // retries.
       root.countriesAuthRequired = false
+    }
+  }
+
+  Process {
+    id: keyringProbe
+    running: false
+    command: []
+    stdout: StdioCollector { id: keyringProbeStdout; waitForEnd: true }
+    onExited: function(exitCode) {
+      var out = String(keyringProbeStdout.text || "").trim()
+      // Anything unexpected reads as "ok": a probe that cannot answer must
+      // not put an accusatory notice in front of the user.
+      root.keyringHealth = (exitCode === 0 && (out === "plaintext" || out === "corrupt")) ? out : "ok"
     }
   }
 
@@ -893,6 +939,7 @@ Item {
       } else {
         root.lastError = ""
         root.actionStatus = ""
+        root._userSignedOut = true
         root.needsLogin = true
         root.accountName = ""
       }

@@ -344,6 +344,65 @@ function loadAgeNotice(minutes) {
   return "Server loads are " + (days === 1 ? "about a day old" : ("about " + days + " days old"))
 }
 
+// --- Keyring health ------------------------------------------------------
+
+// Why a VPN widget knows anything about gnome-keyring.
+//
+// python-proton-keyring-linux stores the whole session as one JSON string
+// (`_set_item` is json.dumps() straight into the Secret Service). That string
+// embeds the VPN certificate's PEM blocks, so it is full of escaped newlines.
+// gnome-keyring's plain-text format — what you get when the keyring has no
+// password — writes a secret out unescaped but unescapes \n when reading it
+// back, so once the session has been read and the collection rewritten, those
+// escapes have become real newlines and the file's INI structure is gone. The
+// daemon then fails to parse it on its next start and discards the entire
+// collection, the app finds no session, and the user is asked to sign in
+// again — forever, because the fresh sign-in is written straight back into
+// the same passwordless keyring.
+//
+// See https://discourse.gnome.org/t/possible-bug-or-feature-storing-getting-data-keyring-protected-vs-unprotected-keyring/20312
+// The read-side `.replace("\n", "\\n")` workaround already in
+// secretservice_backend.py cannot help: by the time it runs the file on disk
+// is already broken and every item in it has been dropped.
+//
+// None of that is fixable here — the widget never touches the keyring, it
+// only shells out to the `protonvpn` CLI. What it can do is stop saying
+// "Sign in to ProtonVPN" as though nothing were wrong, which is what sends
+// the user back around the loop without ever learning why.
+
+// One word on stdout: ok | plaintext | corrupt. $1 is the keyrings directory.
+// Deliberately prints no part of any secret, only a verdict.
+//
+// A passwordless keyring is plain text and starts with a literal `[keyring]`
+// line; an encrypted one starts with the binary "GnomeKeyring" magic, so the
+// first line alone separates them. Corruption is detected structurally: every
+// line of an intact file is a `[section]`, a `key=value`, or blank, so any
+// line that is none of those is a secret that has spilled across the file.
+var KEYRING_PROBE = [
+  'dir="$1"; out=ok',
+  '[ -d "$dir" ] || { echo ok; exit 0; }',
+  'for f in "$dir"/*.keyring; do',
+  '  [ -f "$f" ] || continue',
+  '  read -r first < "$f" || continue',
+  '  [ "$first" = "[keyring]" ] || continue',
+  '  grep -q "on .Proton." "$f" || continue',
+  '  out=plaintext',
+  '  if grep -qvE "^\\[[^]]*\\]$|^[A-Za-z][A-Za-z0-9_-]*=|^$" "$f"; then out=corrupt; break; fi',
+  'done',
+  'echo "$out"'
+].join("\n")
+
+// Kept short on purpose: this renders as a wrapped caption in a bar popup,
+// not a bug report. The one thing the user can actually act on — put a
+// password on the keyring — is the last clause of each.
+function keyringNotice(health) {
+  if (health === "corrupt")
+    return "Your keyring has no password, so ProtonVPN loses this sign-in on every restart — its keyring file is already damaged. Fix it by setting a password on your login keyring."
+  if (health === "plaintext")
+    return "Your keyring has no password, so ProtonVPN can lose this sign-in when you restart. Setting a password on your login keyring prevents it."
+  return ""
+}
+
 function isLocked(tier, maxTier) {
   return (Number(tier) || 0) > (Number(maxTier) || 0)
 }
@@ -492,6 +551,8 @@ if (typeof module !== "undefined") {
     describeCountry: describeCountry,
     featureBadges: featureBadges,
     loadAgeNotice: loadAgeNotice,
+    KEYRING_PROBE: KEYRING_PROBE,
+    keyringNotice: keyringNotice,
     recentKey: recentKey,
     addRecent: addRecent,
     toggleInList: toggleInList,
